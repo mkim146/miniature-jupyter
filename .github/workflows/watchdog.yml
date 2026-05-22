@@ -1,0 +1,59 @@
+name: JupyterHub Watchdog
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping activity
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"servers\": {\"qwen_server\": {\"last_activity\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}}}" \
+            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/activity")
+          echo "Activity ping: $RESPONSE"
+
+      - name: Check server health
+        id: health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+            "https://jupyter.ncsa.illinois.edu/user/mkim146/qwen_server/api/status")
+          echo "Health status: $STATUS"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Restart server
+        if: steps.health.outputs.status != '200'
+        run: |
+          echo "Server is down (HTTP ${{ steps.health.outputs.status }}), restarting..."
+          curl -s -X DELETE \
+            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/servers/qwen_server" \
+            || true  # ignore error if already stopped
+          sleep 5
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/servers/qwen_server")
+          echo "Restart response: $RESPONSE"
+
+      - name: Confirm restart
+        if: steps.health.outputs.status != '200'
+        run: |
+          echo "Waiting 60s for pod to initialize..."
+          sleep 60
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+            "https://jupyter.ncsa.illinois.edu/user/mkim146/qwen_server/api/status")
+          echo "Post-restart status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "Pod is back up — vllm will take ~5 min to fully load"
+          else
+            echo "Pod still starting (normal for large GPU pods)"
+          fi
