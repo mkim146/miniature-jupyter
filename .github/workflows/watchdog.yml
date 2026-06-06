@@ -1,5 +1,4 @@
 name: JupyterHub Watchdog
-
 on:
   schedule:
     - cron: '*/20 * * * *'
@@ -8,52 +7,164 @@ on:
 jobs:
   watchdog:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    env:
+      HUB: https://jupyter.ncsa.illinois.edu
+      USER: mkim146
+      SRV: qwen_server
+      TOKEN: ${{ secrets.JUPYTERHUB_TOKEN }}
 
     steps:
       - name: Ping activity
         run: |
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token $TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"servers\": {\"qwen_server\": {\"last_activity\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}}}" \
-            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/activity")
-          echo "Activity ping: $RESPONSE"
+            -d "{\"servers\":{\"$SRV\":{\"last_activity\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}}}" \
+            "$HUB/hub/api/users/$USER/activity")
+          CODE=$(echo "$RESP" | tail -1)
+          echo "Activity ping: HTTP $CODE"
 
-      - name: Check server health
-        id: health
+      - name: Query Hub API for server state
+        id: hub
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
-            "https://jupyter.ncsa.illinois.edu/user/mkim146/qwen_server/api/status")
-          echo "Health status: $STATUS"
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          RESP=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token $TOKEN" \
+            "$HUB/hub/api/users/$USER")
+          CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | sed '$ d')
+          echo "Hub API: HTTP $CODE"
+
+          if [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; then
+            echo "::error::Auth failure (HTTP $CODE) — JupyterHub token rejected. Check JUPYTERHUB_TOKEN secret."
+            echo "auth_failed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$CODE" != "200" ]; then
+            echo "::warning::Unexpected Hub API response: $CODE"
+            echo "auth_failed=false" >> $GITHUB_OUTPUT
+            echo "ready=false" >> $GITHUB_OUTPUT
+            echo "pending=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Parse server state — falls back gracefully if server key absent
+          READY=$(echo "$BODY" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          srv = d.get('servers', {}).get('$SRV', {})
+          print(str(srv.get('ready', False)).lower())
+          " 2>/dev/null || echo "false")
+
+          PENDING=$(echo "$BODY" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          srv = d.get('servers', {}).get('$SRV', {})
+          print(srv.get('pending') or '')
+          " 2>/dev/null || echo "")
+
+          echo "Server ready=$READY pending='$PENDING'"
+          echo "auth_failed=false" >> $GITHUB_OUTPUT
+          echo "ready=$READY" >> $GITHUB_OUTPUT
+          echo "pending=$PENDING" >> $GITHUB_OUTPUT
+
+      # Hard stop on auth failure — no point attempting restart
+      - name: Abort on auth failure
+        if: steps.hub.outputs.auth_failed == 'true'
+        run: |
+          echo "::error::Watchdog cannot proceed — authentication failed."
+          echo "This is NOT a server outage. The CILogon/SSO session has likely expired."
+          echo "Action required: log in manually at $HUB to renew your session."
+          exit 1
+
+      - name: Decide if restart needed
+        id: decision
+        run: |
+          READY="${{ steps.hub.outputs.ready }}"
+          PENDING="${{ steps.hub.outputs.pending }}"
+
+          if [ "$READY" = "true" ]; then
+            echo "Server is healthy — nothing to do."
+            echo "restart=false" >> $GITHUB_OUTPUT
+          elif [ "$PENDING" = "spawn" ]; then
+            echo "Server is already spawning — skipping restart to avoid collision."
+            echo "restart=false" >> $GITHUB_OUTPUT
+          elif [ "$PENDING" = "stop" ]; then
+            echo "Server is still stopping — will retry next cycle."
+            echo "restart=false" >> $GITHUB_OUTPUT
+          else
+            echo "Server is down and idle — will restart."
+            echo "restart=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Restart server
-        if: steps.health.outputs.status != '200'
+        if: steps.decision.outputs.restart == 'true'
+        id: restart
         run: |
-          echo "Server is down (HTTP ${{ steps.health.outputs.status }}), restarting..."
-          curl -s -X DELETE \
-            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
-            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/servers/qwen_server" \
-            || true  # ignore error if already stopped
+          echo "Stopping server (ignore 404 if already stopped)..."
+          curl -s -o /dev/null -X DELETE \
+            -H "Authorization: token $TOKEN" \
+            "$HUB/hub/api/users/$USER/servers/$SRV" || true
           sleep 5
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
-            "https://jupyter.ncsa.illinois.edu/hub/api/users/mkim146/servers/qwen_server")
-          echo "Restart response: $RESPONSE"
 
-      - name: Confirm restart
-        if: steps.health.outputs.status != '200'
-        run: |
-          echo "Waiting 60s for pod to initialize..."
-          sleep 60
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.JUPYTERHUB_TOKEN }}" \
-            "https://jupyter.ncsa.illinois.edu/user/mkim146/qwen_server/api/status")
-          echo "Post-restart status: $STATUS"
-          if [ "$STATUS" = "200" ]; then
-            echo "Pod is back up — vllm will take ~5 min to fully load"
-          else
-            echo "Pod still starting (normal for large GPU pods)"
+          echo "Starting server..."
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token $TOKEN" \
+            "$HUB/hub/api/users/$USER/servers/$SRV")
+          CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | sed '$ d')
+          echo "Start: HTTP $CODE — $BODY"
+
+          if [ "$CODE" = "400" ]; then
+            # 400 often means the hub thinks the server is still running
+            echo "::warning::Start returned 400 — possible state mismatch. Will poll anyway."
+          elif [ "$CODE" != "201" ] && [ "$CODE" != "202" ]; then
+            echo "::warning::Unexpected start response: $CODE"
           fi
+
+      - name: Poll Hub API until server is ready
+        if: steps.decision.outputs.restart == 'true'
+        run: |
+          echo "Polling Hub API for readiness (30s intervals, max 10 min)..."
+          for i in $(seq 1 20); do
+            sleep 30
+            RESP=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: token $TOKEN" \
+              "$HUB/hub/api/users/$USER")
+            CODE=$(echo "$RESP" | tail -1)
+            BODY=$(echo "$RESP" | sed '$ d')
+
+            READY=$(echo "$BODY" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          srv = d.get('servers', {}).get('$SRV', {})
+          print(str(srv.get('ready', False)).lower())
+            " 2>/dev/null || echo "false")
+
+            PENDING=$(echo "$BODY" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          srv = d.get('servers', {}).get('$SRV', {})
+          print(srv.get('pending') or 'none')
+            " 2>/dev/null || echo "unknown")
+
+            echo "Poll $i/20 ($(($i * 30))s): HTTP $CODE | ready=$READY | pending=$PENDING"
+
+            if [ "$READY" = "true" ]; then
+              echo "Pod is up — vLLM will take ~5 min to fully load."
+              exit 0
+            fi
+
+            # If pending cleared but server isn't ready, spawn failed silently
+            if [ $i -ge 4 ] && [ "$PENDING" = "none" ] && [ "$READY" != "true" ]; then
+              echo "::error::Server not pending and not ready after $(($i * 30))s."
+              echo "Possible causes: CILogon session expired, resource quota exceeded, or node unavailable."
+              echo "Manual action required: log in at $HUB to trigger a fresh spawn."
+              exit 1
+            fi
+          done
+
+          echo "::error::Server did not reach ready state within 10 minutes."
+          echo "Manual login at $HUB may be needed to re-establish your SSO session."
+          exit 1
